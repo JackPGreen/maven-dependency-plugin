@@ -29,18 +29,21 @@ import org.apache.maven.api.di.Provides;
 import org.apache.maven.api.plugin.testing.InjectMojo;
 import org.apache.maven.api.plugin.testing.MojoParameter;
 import org.apache.maven.api.plugin.testing.MojoTest;
+import org.apache.maven.artifact.Artifact;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Dependency;
 import org.apache.maven.model.DependencyManagement;
 import org.apache.maven.model.Exclusion;
 import org.apache.maven.model.InputLocation;
 import org.apache.maven.model.InputSource;
+import org.apache.maven.model.Model;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.logging.Log;
-import org.apache.maven.plugins.dependency.utils.ResolverUtil;
+import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
+import org.apache.maven.shared.dependency.graph.DependencyGraphBuilder;
+import org.apache.maven.shared.dependency.graph.DependencyNode;
 import org.eclipse.aether.DefaultRepositorySystemSession;
-import org.eclipse.aether.artifact.DefaultArtifact;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -51,6 +54,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -72,20 +76,28 @@ class AnalyzeExclusionsMojoTest {
     private Log testLog;
 
     @Mock
-    private ResolverUtil resolverUtil;
+    private DependencyGraphBuilder dependencyGraphBuilder;
 
     @Provides
-    private ResolverUtil resolverUtilProvides() {
-        return resolverUtil;
+    private DependencyGraphBuilder dependencyGraphBuilderProvides() {
+        return dependencyGraphBuilder;
     }
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
+        Model model = new Model();
+        model.setGroupId("testGroupId");
+        model.setArtifactId("testArtifactId");
+        model.setVersion("1.0.0");
+
         when(project.getGroupId()).thenReturn("testGroupId");
         when(project.getArtifactId()).thenReturn("testArtifactId");
         when(project.getVersion()).thenReturn("1.0.0");
+        when(project.getModel()).thenReturn(model);
 
         lenient().when(mavenSession.getRepositorySession()).thenReturn(new DefaultRepositorySystemSession());
+        lenient().when(mavenSession.getProjectBuildingRequest()).thenReturn(new DefaultProjectBuildingRequest());
+        lenient().doReturn(rootNode()).when(dependencyGraphBuilder).buildDependencyGraph(any(), any());
     }
 
     @Test
@@ -139,9 +151,7 @@ class AnalyzeExclusionsMojoTest {
         dependencyWithWildcardExclusion.addExclusion(exclusion("*", "*"));
         when(project.getDependencies()).thenReturn(Collections.singletonList(dependencyWithWildcardExclusion));
 
-        when(resolverUtil.collectDependencies(any()))
-                .thenReturn(Collections.singletonList(new org.eclipse.aether.graph.Dependency(
-                        new DefaultArtifact("whatever", "ok", "jar", "1.0"), "")));
+        doReturn(rootNode(node("whatever", "ok"))).when(dependencyGraphBuilder).buildDependencyGraph(any(), any());
 
         mojo.execute();
         verify(testLog, never()).warn(anyString());
@@ -168,9 +178,7 @@ class AnalyzeExclusionsMojoTest {
         dependencies.add(dependency);
         when(project.getDependencies()).thenReturn(dependencies);
 
-        when(resolverUtil.collectDependencies(any()))
-                .thenReturn(Collections.singletonList(
-                        new org.eclipse.aether.graph.Dependency(new DefaultArtifact("ok", "ok", "jar", "1.0"), "")));
+        doReturn(rootNode(node("ok", "ok"))).when(dependencyGraphBuilder).buildDependencyGraph(any(), any());
 
         assertThatCode(mojo::execute).doesNotThrowAnyException();
 
@@ -219,6 +227,7 @@ class AnalyzeExclusionsMojoTest {
     void testMojoWithProjectDependencyManagementEmpty(AnalyzeExclusionsMojo mojo) {
         DependencyManagement dependencyManagement = mock(DependencyManagement.class);
         lenient().when(dependencyManagement.getDependencies()).thenReturn(Collections.emptyList());
+        when(project.getDependencyManagement()).thenReturn(dependencyManagement);
 
         assertThatCode(mojo::execute).doesNotThrowAnyException();
     }
@@ -255,5 +264,22 @@ class AnalyzeExclusionsMojoTest {
         inputSource.setModelId("testGroupId:testArtifactId:1.0.0");
         exclusion.setLocation("", new InputLocation(1, 1, inputSource));
         return exclusion;
+    }
+
+    private DependencyNode rootNode(DependencyNode... children) {
+        DependencyNode root = mock(DependencyNode.class);
+        lenient().when(root.getChildren()).thenReturn(Arrays.asList(children));
+        return root;
+    }
+
+    private DependencyNode node(String groupId, String artifactId, DependencyNode... children) {
+        Artifact artifact = mock(Artifact.class);
+        lenient().when(artifact.getGroupId()).thenReturn(groupId);
+        lenient().when(artifact.getArtifactId()).thenReturn(artifactId);
+
+        DependencyNode node = mock(DependencyNode.class);
+        lenient().when(node.getArtifact()).thenReturn(artifact);
+        lenient().when(node.getChildren()).thenReturn(Arrays.asList(children));
+        return node;
     }
 }

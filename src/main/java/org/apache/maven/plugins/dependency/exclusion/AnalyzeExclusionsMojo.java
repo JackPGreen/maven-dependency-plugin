@@ -20,28 +20,33 @@ package org.apache.maven.plugins.dependency.exclusion;
 
 import javax.inject.Inject;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
-import org.apache.maven.RepositoryUtils;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Dependency;
 import org.apache.maven.model.DependencyManagement;
 import org.apache.maven.model.Exclusion;
+import org.apache.maven.model.Model;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
-import org.apache.maven.plugins.dependency.utils.ResolverUtil;
+import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
-import org.eclipse.aether.artifact.ArtifactTypeRegistry;
-import org.eclipse.aether.collection.DependencyCollectionException;
+import org.apache.maven.project.ProjectBuildingRequest;
+import org.apache.maven.shared.dependency.graph.DependencyGraphBuilder;
+import org.apache.maven.shared.dependency.graph.DependencyGraphBuilderException;
+import org.apache.maven.shared.dependency.graph.DependencyNode;
 
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
@@ -61,14 +66,15 @@ public class AnalyzeExclusionsMojo extends AbstractMojo {
 
     private final MavenProject project;
 
-    private final ResolverUtil resolverUtil;
+    private final DependencyGraphBuilder dependencyGraphBuilder;
 
     private final MavenSession session;
 
     @Inject
-    public AnalyzeExclusionsMojo(MavenProject project, ResolverUtil resolverUtil, MavenSession session) {
+    public AnalyzeExclusionsMojo(
+            MavenProject project, DependencyGraphBuilder dependencyGraphBuilder, MavenSession session) {
         this.project = project;
-        this.resolverUtil = resolverUtil;
+        this.dependencyGraphBuilder = dependencyGraphBuilder;
         this.session = session;
     }
 
@@ -136,30 +142,20 @@ public class AnalyzeExclusionsMojo extends AbstractMojo {
 
         ExclusionChecker checker = new ExclusionChecker();
 
-        ArtifactTypeRegistry artifactTypeRegistry =
-                session.getRepositorySession().getArtifactTypeRegistry();
         for (Map.Entry<Coordinates, Collection<Exclusion>> entry : dependenciesWithExclusions.entrySet()) {
 
             Coordinates currentCoordinates = entry.getKey();
 
-            Collection<org.eclipse.aether.graph.Dependency> actualDependencies;
             try {
-                actualDependencies = resolverUtil.collectDependencies(
-                        RepositoryUtils.toDependency(currentCoordinates.getDependency(), artifactTypeRegistry)
-                                .setExclusions(null));
-            } catch (DependencyCollectionException e) {
+                Set<Coordinates> actualCoordinates = collectActualCoordinates(currentCoordinates);
+
+                Set<Coordinates> exclusions =
+                        entry.getValue().stream().map(Coordinates::coordinates).collect(toSet());
+
+                checker.check(currentCoordinates, exclusions, actualCoordinates);
+            } catch (DependencyGraphBuilderException e) {
                 throw new MojoExecutionException(e.getMessage(), e);
             }
-
-            Set<Coordinates> actualCoordinates = actualDependencies.stream()
-                    .map(org.eclipse.aether.graph.Dependency::getArtifact)
-                    .map(a -> coordinates(a.getGroupId(), a.getArtifactId()))
-                    .collect(toSet());
-
-            Set<Coordinates> exclusions =
-                    entry.getValue().stream().map(Coordinates::coordinates).collect(toSet());
-
-            checker.check(currentCoordinates, exclusions, actualCoordinates);
         }
 
         if (!checker.getViolations().isEmpty()) {
@@ -191,5 +187,65 @@ public class AnalyzeExclusionsMojo extends AbstractMojo {
             logger.accept("    " + dependency);
             invalidExclusions.forEach(invalidExclusion -> logger.accept("        - " + invalidExclusion));
         });
+    }
+
+    private Set<Coordinates> collectActualCoordinates(Coordinates currentCoordinates)
+            throws DependencyGraphBuilderException {
+        ProjectBuildingRequest buildingRequest = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
+        buildingRequest.setProject(createProjectForDependency(currentCoordinates));
+
+        DependencyNode dependencyGraph = dependencyGraphBuilder.buildDependencyGraph(buildingRequest, null);
+
+        Deque<DependencyNode> nodes = new ArrayDeque<>(dependencyGraph.getChildren());
+        Set<Coordinates> actualCoordinates = new java.util.HashSet<>();
+        while (!nodes.isEmpty()) {
+            DependencyNode node = nodes.removeFirst();
+            actualCoordinates.add(coordinates(
+                    node.getArtifact().getGroupId(), node.getArtifact().getArtifactId()));
+            nodes.addAll(node.getChildren());
+        }
+
+        return actualCoordinates;
+    }
+
+    private MavenProject createProjectForDependency(Coordinates currentCoordinates) {
+        Model model = project.getModel().clone();
+        model.setDependencies(
+                Collections.singletonList(copyDependencyWithoutExclusions(currentCoordinates.getDependency())));
+        model.setDependencyManagement(copyDependencyManagementWithoutExclusions(currentCoordinates));
+
+        MavenProject projectForAnalysis = new MavenProject(model);
+        projectForAnalysis.setArtifact(project.getArtifact());
+        projectForAnalysis.setFile(project.getFile());
+        projectForAnalysis.setParent(project.getParent());
+        projectForAnalysis.setProjectBuildingRequest(project.getProjectBuildingRequest());
+
+        return projectForAnalysis;
+    }
+
+    private Dependency copyDependencyWithoutExclusions(Dependency dependency) {
+        Dependency copiedDependency = dependency.clone();
+        copiedDependency.setExclusions(Collections.emptyList());
+        return copiedDependency;
+    }
+
+    private DependencyManagement copyDependencyManagementWithoutExclusions(Coordinates currentCoordinates) {
+        DependencyManagement dependencyManagement = project.getDependencyManagement();
+        if (dependencyManagement == null) {
+            return null;
+        }
+
+        DependencyManagement copiedDependencyManagement = dependencyManagement.clone();
+        copiedDependencyManagement.setDependencies(copiedDependencyManagement.getDependencies().stream()
+                .map(dependency -> sameArtifact(currentCoordinates, dependency)
+                        ? copyDependencyWithoutExclusions(dependency)
+                        : dependency.clone())
+                .collect(toList()));
+        return copiedDependencyManagement;
+    }
+
+    private boolean sameArtifact(Coordinates currentCoordinates, Dependency dependency) {
+        return currentCoordinates.getGroupId().equals(dependency.getGroupId())
+                && currentCoordinates.getArtifactId().equals(dependency.getArtifactId());
     }
 }
